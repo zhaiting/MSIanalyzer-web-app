@@ -3,31 +3,156 @@ import os
 import json
 import tempfile
 import subprocess
+from typing import Dict, List
 
 import streamlit as st
 
 
-def run_msianalyzer(marker: str,
-                    manifest_file,
-                    fastq_files,
-                    run_tests: bool,
-                    threads: int):
-    """Run MSIanalyzer in a temporary working directory and return results."""
+# -------------------------------------------------------------------
+# 1. Marker definitions (fill out for all 5 markers as needed)
+#    For now BAT25 is filled; others are placeholders for you to edit.
+# -------------------------------------------------------------------
+MARKERS: Dict[str, Dict[str, str]] = {
+    "BAT25": {
+        "seq1": "TCGCCTCCAAGAATGTAA",
+        "seq2": "ACTATGGCTCTAAAATGCTCTGT",
+        "motif": "T",
+    },
+    "BAT26": {
+        "seq1": "TGACTACTTTTGACTTCAGCC",
+        "seq2": "AACCATTCAACATTTTTAACC",
+        "motif": "A",
+    },
+    "D2S123": {
+        "seq1": "AAACAGGATGCCTGCCTTTA",
+        "seq2": "GGACTTTCCACCTATGGGAC",
+        "motif": "AC",
+    },
+    "D5S346": {
+        "seq1": "ACTCACTCTAGTGATAAATCGGG",
+        "seq2": "AGCAGATAAGACAGTATTACTAGTT",
+        "motif": "CA",
+    },
+    "D17S250": {
+        "seq1": "GGAAGAATCAAATAGACAAT",
+        "seq2": "GCTGGCCATATATATATTTAAACC",
+        "motif": "AC",
+    },
+}
 
-    # Use a temporary working directory for this run
+
+def infer_stub_from_filename(filename: str) -> str:
+    """
+    Infer a 'stub' ID from a FASTQ filename, e.g.
+    BVSBWG_3_500x.fastq.gz -> BVSBWG_3
+    """
+    base = os.path.basename(filename)
+
+    # Strip common FASTQ extensions
+    for ext in (".fastq.gz", ".fq.gz", ".fastq", ".fq"):
+        if base.endswith(ext):
+            base = base[:-len(ext)]
+            break
+
+    parts = base.split("_")
+    if len(parts) > 1:
+        return "_".join(parts[:-1])
+    return base
+
+
+def parse_group_map_text(text: str) -> Dict[str, str]:
+    """
+    Parse a simple mapping like:
+
+        BVSBWG_3=Sample1
+        BVSBWG_5=Sample2
+
+    into {"BVSBWG_3": "Sample1", "BVSBWG_5": "Sample2"}.
+    Lines starting with # or empty lines are ignored.
+    """
+    mapping: Dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            stub, name = line.split("=", 1)
+            stub = stub.strip()
+            name = name.strip()
+            if stub and name:
+                mapping[stub] = name
+    return mapping
+
+
+def build_runtime_config(
+    marker: str,
+    fastq_paths: List[str],
+    min_similarity: float,
+    anchor_units: int,
+    user_group_map_text: str,
+) -> Dict:
+    """
+    Build the marker JSON config in memory based on:
+    - selected marker (seq1, seq2, motif)
+    - uploaded FASTQ files (paths)
+    - numeric parameters (min_similarity, anchor_units)
+    - optional user-specified group_map
+    """
+
+    if marker not in MARKERS:
+        raise ValueError(f"Marker '{marker}' is not defined in MARKERS dict.")
+
+    marker_def = MARKERS[marker]
+
+    # Parse optional user-specified mapping text
+    user_map = parse_group_map_text(user_group_map_text or "")
+
+    # Build group_map based on stubs from filenames
+    group_map: Dict[str, str] = {}
+    for fq in fastq_paths:
+        stub = infer_stub_from_filename(fq)
+        # If user gave an explicit mapping, use it; otherwise use stub as sample name
+        sample_name = user_map.get(stub, stub)
+        group_map[stub] = sample_name
+
+    cfg = {
+        "markers": {
+            marker: {
+                "seq1": marker_def["seq1"],
+                "seq2": marker_def["seq2"],
+                "motif": marker_def["motif"],
+                "group_map": group_map,
+                "fastq_files": fastq_paths,
+            }
+        },
+        "min_similarity": float(min_similarity),
+        "anchor_units": int(anchor_units),
+        # Also set top-level fastq_files; MSIanalyzer uses this as global default.
+        "fastq_files": fastq_paths,
+    }
+
+    return cfg
+
+
+def run_msianalyzer(
+    marker: str,
+    fastq_files,
+    min_similarity: float,
+    anchor_units: int,
+    run_tests: bool,
+    skip_variant_summary: bool,
+    threads: int,
+    group_map_text: str,
+):
+    """Run MSIanalyzer in a temporary working directory and show results in Streamlit."""
     with tempfile.TemporaryDirectory() as tmpdir:
         st.write(f"Working directory: `{tmpdir}`")
 
-        # 1) Save manifest JSON
-        manifest_path = os.path.join(tmpdir, manifest_file.name)
-        with open(manifest_path, "wb") as f:
-            f.write(manifest_file.read())
-
-        # 2) Save FASTQs into a subfolder
+        # 1) Save FASTQs into a subfolder
         fastq_dir = os.path.join(tmpdir, "fastq")
         os.makedirs(fastq_dir, exist_ok=True)
 
-        fastq_paths = []
+        fastq_paths: List[str] = []
         for fobj in fastq_files:
             fq_path = os.path.join(fastq_dir, fobj.name)
             with open(fq_path, "wb") as fh:
@@ -42,30 +167,35 @@ def run_msianalyzer(marker: str,
         for p in fastq_paths:
             st.write(os.path.basename(p))
 
-        # 3) Load and update the manifest JSON
+        # 2) Build runtime config in memory
         try:
-            with open(manifest_path, "r") as f:
-                cfg = json.load(f)
-        except json.JSONDecodeError as e:
-            st.error("Uploaded manifest file is not valid JSON.")
+            cfg = build_runtime_config(
+                marker=marker,
+                fastq_paths=fastq_paths,
+                min_similarity=min_similarity,
+                anchor_units=anchor_units,
+                user_group_map_text=group_map_text,
+            )
+        except Exception as e:
+            st.error("Failed to build marker configuration.")
             st.exception(e)
             st.stop()
 
-        # Overwrite fastq_files to use the uploaded FASTQs
-        cfg["fastq_files"] = fastq_paths
-
-        updated_manifest_path = os.path.join(tmpdir, "manifest_runtime.json")
-        with open(updated_manifest_path, "w") as f:
+        # 3) Write config to JSON in temp dir
+        manifest_path = os.path.join(tmpdir, "manifest_runtime.json")
+        with open(manifest_path, "w") as f:
             json.dump(cfg, f, indent=2)
 
-        st.markdown("**Updated manifest (runtime copy) written to:**")
-        st.code(updated_manifest_path)
+        st.markdown("**Runtime manifest written to:**")
+        st.code(manifest_path)
 
         # 4) Build command
         st.subheader("Command to be executed")
-        cmd = ["msianalyzer", "run-marker", marker, updated_manifest_path]
+        cmd = ["msianalyzer", "run-marker", marker, manifest_path]
         if run_tests:
             cmd.append("--run-tests")
+        if skip_variant_summary:
+            cmd.append("--skip-variant-summary")
         if threads and threads > 1:
             cmd.extend(["--threads", str(threads)])
 
@@ -73,13 +203,12 @@ def run_msianalyzer(marker: str,
 
         # 5) Run MSIanalyzer
         try:
-            # Add a timeout to avoid hanging forever if something goes wrong
             result = subprocess.run(
                 cmd,
                 cwd=tmpdir,
                 capture_output=True,
                 text=True,
-                timeout=3600,  # 1 hour; adjust as needed
+                timeout=3600,  # 1 hour; adjust if needed
             )
         except FileNotFoundError as e:
             st.error(
@@ -106,7 +235,7 @@ def run_msianalyzer(marker: str,
 
         if result.returncode != 0:
             st.error(f"MSIanalyzer exited with non-zero code: {result.returncode}")
-            # We still show any files that might have been produced below.
+            # Still show any files that were produced.
         else:
             st.success("MSIanalyzer finished successfully.")
 
@@ -135,42 +264,66 @@ def run_msianalyzer(marker: str,
 
 
 def main():
-    # This must be the first Streamlit call
     st.set_page_config(page_title="MSIanalyzer Web App", layout="wide")
 
     st.title("MSIanalyzer Web Interface")
 
     st.markdown(
         """
-This web app runs **MSIanalyzer** on user-provided input.
+This web app runs **MSIanalyzer** on user-provided FASTQ files,
+using built-in definitions for the Bethesda panel markers.
 
 **Workflow:**
 
-1. Enter the marker name (e.g., `BAT25`).
-2. Upload a JSON marker/manifest file for that marker.
-3. Upload one or more FASTQ files (Nanopore reads for the marker).
-4. The app will:
-   - Save the uploaded files to a temporary working directory,
-   - Rewrite the `fastq_files` field in the JSON to point to the uploaded FASTQs,
+1. Select the marker (BAT25, BAT26, D2S123, D5S346, D17S250).
+2. Optionally adjust `min_similarity` and `anchor_units` (defaults match the paper/example).
+3. Upload one or more FASTQ files (Nanopore reads for that marker).
+4. Optionally provide a mapping from FASTQ-derived IDs to sample/group names.
+5. The app will:
+   - Save FASTQs to a temporary working directory,
+   - Build an internal JSON manifest (primers, motif, group_map, fastq_files, parameters),
    - Run `msianalyzer run-marker`,
    - Show logs and make output files available for download.
-
-For simplicity, the contents of `fastq_files` in your uploaded JSON are **ignored** and replaced by the uploaded FASTQs.
 """
     )
 
-    st.header("1. Input parameters")
+    st.header("1. Marker and parameters")
 
-    marker = st.text_input(
-        "Marker name",
-        value="BAT25",
-        help="This is the marker passed to `msianalyzer run-marker`.",
+    marker = st.selectbox(
+        "Marker",
+        options=list(MARKERS.keys()),
+        index=0,
+        help="Marker name passed to `msianalyzer run-marker`.",
+    )
+
+    min_similarity = st.number_input(
+        "Minimum similarity (`min_similarity`)",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.85,
+        step=0.01,
+        help="Similarity threshold for anchor-extension matching.",
+    )
+
+    anchor_units = st.number_input(
+        "Anchor units (`anchor_units`)",
+        min_value=1,
+        max_value=20,
+        value=3,
+        step=1,
+        help="Number of repeat units used as the anchor.",
     )
 
     run_tests = st.checkbox(
         "Run MSIanalyzer tests (`--run-tests`)",
         value=False,
         help="If checked, `--run-tests` is added to the command.",
+    )
+
+    skip_variant_summary = st.checkbox(
+        "Skip variant summary (`--skip-variant-summary`)",
+        value=False,
+        help="If checked, `--skip-variant-summary` is added to the command.",
     )
 
     threads = st.number_input(
@@ -182,14 +335,7 @@ For simplicity, the contents of `fastq_files` in your uploaded JSON are **ignore
         help="Number of threads to use for MSIanalyzer (if >1, `--threads` is used).",
     )
 
-    st.header("2. Upload inputs")
-
-    manifest_file = st.file_uploader(
-        "Upload MSIanalyzer JSON marker/manifest file",
-        type=["json"],
-        help="This JSON describes the marker (primers, reference, etc.). "
-             "`fastq_files` will be overwritten.",
-    )
+    st.header("2. Upload FASTQ files")
 
     fastq_files = st.file_uploader(
         "Upload FASTQ file(s) for this marker",
@@ -198,29 +344,47 @@ For simplicity, the contents of `fastq_files` in your uploaded JSON are **ignore
         help="You can select multiple FASTQ files at once (e.g. multiple samples or replicates).",
     )
 
-    st.header("3. Run MSIanalyzer")
+    st.header("3. Optional: specify sample names")
+
+    st.markdown(
+        """
+        By default, sample IDs are inferred from FASTQ filenames by removing the extension
+        and dropping the last underscore-delimited token (e.g., `BVSBWG_3_500x.fastq` → stub `BVSBWG_3`),
+        and the stub itself is used as the sample name.
+
+        You can override this by providing mappings like:
+        BVSBWG_3 = Sample1
+        BVSBWG_5 = Sample2
+        One mapping per line, `stub = SampleName`.
+        """
+    )
+
+    group_map_text = st.text_area(
+        "Optional stub → sample name mapping",
+        value="",
+        height=120,
+    )
+
+    st.header("4. Run MSIanalyzer")
 
     if st.button("Run analysis"):
-        # Basic validation
-        if manifest_file is None:
-            st.error("Please upload a JSON marker/manifest file.")
-        elif not fastq_files:
+        if not fastq_files:
             st.error("Please upload at least one FASTQ file.")
-        elif not marker.strip():
-            st.error("Please provide a marker name.")
         else:
             with st.spinner(
                 "Running MSIanalyzer... this may take a few minutes depending on input size."
             ):
                 run_msianalyzer(
-                    marker=marker.strip(),
-                    manifest_file=manifest_file,
+                    marker=marker,
                     fastq_files=fastq_files,
+                    min_similarity=float(min_similarity),
+                    anchor_units=int(anchor_units),
                     run_tests=run_tests,
+                    skip_variant_summary=skip_variant_summary,
                     threads=int(threads),
+                    group_map_text=group_map_text,
                 )
 
 
 if __name__ == "__main__":
-    # This is executed when Streamlit runs `app.py`
     main()
