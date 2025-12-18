@@ -488,20 +488,22 @@ def main():
 
     st.markdown(
         """
-This web app runs **MSIanalyzer** on user-provided FASTQ files,
-using built-in definitions for the Bethesda panel markers.
+        This web app provides a browser-based interface to the
+        [**MSIanalyzer**](https://github.com/NagelLabHub/MSIanalyzer) command-line tool.
 
-**Workflow:**
+        **Workflow:**
 
-1. Select the marker (BAT25, BAT26, D2S123, D5S346, D17S250).
-2. Optionally adjust `min_similarity` and `anchor_units`.
-3. Upload one or more FASTQ files (Nanopore reads for that marker).
-4. Optionally provide a mapping from FASTQ-derived IDs to sample/group names.
-5. Click **Run analysis**.
-6. Optionally generate a pileup plot for one of the FASTQs.
-7. You can download any output files without losing the others.
-8. Click **Clear results** if you want to reset and start again.
-"""
+        1. Select the Bethesda panel marker (BAT25, BAT26, D2S123, D5S346, D17S250).
+        2. Optionally adjust `min_similarity` and `anchor_units`.
+        3. Upload one or more FASTQ files (Nanopore reads for that marker).
+        4. Optionally provide a mapping from FASTQ-derived IDs to sample/group names.
+        5. Click **Run analysis**.
+        6. Optionally generate a pileup plot for one of the FASTQs.
+        7. You can download any output files without losing the others.
+        8. Click **Clear results** if you want to reset and start again.
+
+        Questions or issues: open an issue on the GitHub repo.
+        """
     )
 
     # Top-level controls
@@ -566,16 +568,16 @@ using built-in definitions for the Bethesda panel markers.
 
     st.markdown(
         """
-By default, sample IDs are inferred from FASTQ filenames by removing the extension
-and dropping the last underscore-delimited token (e.g., `BVSBWG_3_500x.fastq` → stub `BVSBWG_3`),
-and the stub itself is used as the sample name.
+        By default, sample IDs are inferred from FASTQ filenames by removing the extension
+        and dropping the last underscore-delimited token (e.g., `BVSBWG_3_500x.fastq` → stub `BVSBWG_3`),
+        and the stub itself is used as the sample name.
 
-You can override this by providing mappings like:
+        You can override this by providing mappings like:
 
-BVSBWG_3 = Sample1
+        BVSBWG_3 = Sample1
 
-One mapping per line, `stub = SampleName`.
-"""
+        One mapping per line, `stub = SampleName`.
+        """
     )
 
     group_map_text = st.text_area(
