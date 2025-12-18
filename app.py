@@ -5,6 +5,7 @@ import tempfile
 import shutil
 import subprocess
 import base64
+from pathlib import Path
 from typing import Dict, List
 
 import streamlit as st
@@ -137,7 +138,7 @@ def build_runtime_config(
 def init_session_state():
     """Initialize keys in session_state, if needed."""
     if "results" not in st.session_state:
-        st.session_state["results"] = None  # will hold logs + file list
+        st.session_state["results"] = None  # will hold logs + file list + fastqs
     if "tmpdir" not in st.session_state:
         st.session_state["tmpdir"] = None
 
@@ -145,7 +146,7 @@ def init_session_state():
 def clear_results():
     """Clear results and (optionally) delete temp directory."""
     tmpdir = st.session_state.get("tmpdir")
-    # We can optionally clean up tmpdir here; but OS temp dirs will be cleaned automatically.
+    # Optional: shutil.rmtree(tmpdir, ignore_errors=True)
     st.session_state["results"] = None
     st.session_state["tmpdir"] = None
 
@@ -161,8 +162,10 @@ def embed_svg(path: str, caption: str):
     html = f'<img src="data:image/svg+xml;base64,{b64}" alt="{caption}" />'
     st.markdown(html, unsafe_allow_html=True)
 
-from pathlib import Path
+
+# Local hg38 reference directory, vendored into this repo
 EXAMPLES_HG38_DIR = Path(__file__).resolve().parent / "hg38"
+
 
 def get_reference_for_marker(marker: str) -> str:
     """
@@ -185,6 +188,7 @@ def get_reference_for_marker(marker: str) -> str:
     raise FileNotFoundError(
         f"No reference FASTA found in {EXAMPLES_HG38_DIR} for marker '{marker}'."
     )
+
 
 # -------------------------------------------------------------------
 # Core runner (does the heavy work once, stores in session_state)
@@ -301,13 +305,47 @@ def run_msianalyzer_once(
         "stderr": result.stderr or "",
         "returncode": result.returncode,
         "files": files_info,
+        "fastq_paths": fastq_paths,  # store full paths for pileup
+        "marker": marker,
     }
+
+
+def refresh_results_files():
+    """Re-scan tmpdir and refresh the file list in st.session_state['results']."""
+    tmpdir = st.session_state.get("tmpdir")
+    res = st.session_state.get("results")
+    if not tmpdir or not res:
+        return
+    if not os.path.isdir(tmpdir):
+        return
+
+    files_info = []
+    for root, dirs, files in os.walk(tmpdir):
+        rel_root = os.path.relpath(root, tmpdir)
+        for name in files:
+            path = os.path.join(root, name)
+            relpath = os.path.join(rel_root, name) if rel_root != "." else name
+            files_info.append(
+                {
+                    "path": path,
+                    "relpath": relpath,
+                    "name": name,
+                }
+            )
+    res["files"] = files_info
+    st.session_state["results"] = res
+
 
 def run_pileup_and_show(marker: str, fastq_path: str):
     """
     Run the `msianalyzer pileup` command for the given FASTQ and reference.
-    Displays the resulting plot in Streamlit.
+    Uses the same tmpdir as the main analysis and updates results.
     """
+
+    tmpdir = st.session_state.get("tmpdir")
+    if not tmpdir or not os.path.isdir(tmpdir):
+        st.error("No working directory found. Please run the main analysis first.")
+        return
 
     try:
         ref_path = get_reference_for_marker(marker)
@@ -315,22 +353,14 @@ def run_pileup_and_show(marker: str, fastq_path: str):
         st.error(str(e))
         return
 
-    # Create a temp working directory for this run
-    tmpdir = tempfile.mkdtemp(prefix="msianalyzer_pileup_")
     st.write(f"Pileup working directory: `{tmpdir}`")
 
-    # Copy or link the input FASTQ into tmpdir
-    local_fastq = os.path.join(tmpdir, os.path.basename(fastq_path))
-    try:
-        # If we already have a local path (e.g., from upload), just copy
-        shutil.copy(fastq_path, local_fastq)
-    except Exception:
-        st.error(f"Failed to stage FASTQ for pileup: {fastq_path}")
+    if not os.path.isfile(fastq_path):
+        st.error(f"FASTQ file not found on disk for pileup: {fastq_path}")
         return
 
     # Build the pileup command
-    cmd = ["msianalyzer", "pileup", local_fastq, ref_path]
-
+    cmd = ["msianalyzer", "pileup", fastq_path, ref_path]
     st.code(" ".join(cmd), language="bash")
 
     # Execute the pileup
@@ -349,40 +379,48 @@ def run_pileup_and_show(marker: str, fastq_path: str):
         st.error("Pileup command timed out.")
         return
 
+    st.subheader("Pileup command output")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("**stdout (pileup)**")
+        st.text_area("pileup_stdout", result.stdout or "(no stdout)", height=200)
+    with col2:
+        st.markdown("**stderr (pileup)**")
+        st.text_area("pileup_stderr", result.stderr or "(no stderr)", height=200)
+
     if result.returncode != 0:
         st.error(f"`msianalyzer pileup` exited with code {result.returncode}")
-        st.text_area("stderr", result.stderr or "(no stderr)")
         return
 
-    # Locate any image files created by the pileup command in tmpdir
+    # Update files list in results so new plots appear in the general "Generated files" section
+    refresh_results_files()
+    st.success("Pileup completed. New files have been added to the generated files list below.")
+
+    # Optionally, also show any image files created by pileup directly
     plot_files = [
-        os.path.join(tmpdir, f)
-        for f in os.listdir(tmpdir)
-        if f.lower().endswith((".png", ".svg", ".jpg", ".jpeg"))
+        finfo["path"]
+        for finfo in st.session_state["results"]["files"]
+        if finfo["name"].lower().endswith((".png", ".jpg", ".jpeg", ".svg"))
     ]
 
-    if not plot_files:
-        st.warning("No plot files were produced by the pileup command.")
-        return
-
-    st.subheader("Pileup Plot Results")
-    for filepath in plot_files:
-        name = os.path.basename(filepath)
-        if name.lower().endswith(".svg"):
-            st.markdown(f"**SVG: {name}**")
-            embed_svg(filepath, caption=name)
-        else:
-            st.image(filepath, caption=name)
-
-        # Add download button
-        with open(filepath, "rb") as fh:
-            data = fh.read()
+    if plot_files:
+        st.subheader("Pileup Plot Results")
+        for filepath in plot_files:
+            name = os.path.basename(filepath)
+            if name.lower().endswith(".svg"):
+                st.markdown(f"**SVG: {name}**")
+                embed_svg(filepath, caption=name)
+            else:
+                st.image(filepath, caption=name)
+            with open(filepath, "rb") as fh:
+                data = fh.read()
             st.download_button(
                 label=f"Download {name}",
                 data=data,
                 file_name=name,
                 key=f"pileup_{name}",
             )
+
 
 # -------------------------------------------------------------------
 # UI rendering of stored results (no heavy work)
@@ -460,8 +498,9 @@ using built-in definitions for the Bethesda panel markers.
 3. Upload one or more FASTQ files (Nanopore reads for that marker).
 4. Optionally provide a mapping from FASTQ-derived IDs to sample/group names.
 5. Click **Run analysis**.
-6. You can download any output files without losing the others.
-7. Click **Clear results** if you want to reset and start again.
+6. Optionally generate a pileup plot for one of the FASTQs.
+7. You can download any output files without losing the others.
+8. Click **Clear results** if you want to reset and start again.
 """
     )
 
@@ -527,16 +566,16 @@ using built-in definitions for the Bethesda panel markers.
 
     st.markdown(
         """
-        By default, sample IDs are inferred from FASTQ filenames by removing the extension
-        and dropping the last underscore-delimited token (e.g., `BVSBWG_3_500x.fastq` → stub `BVSBWG_3`),
-        and the stub itself is used as the sample name.
+By default, sample IDs are inferred from FASTQ filenames by removing the extension
+and dropping the last underscore-delimited token (e.g., `BVSBWG_3_500x.fastq` → stub `BVSBWG_3`),
+and the stub itself is used as the sample name.
 
-        You can override this by providing mappings like: 
+You can override this by providing mappings like:
 
-        BVSBWG_3 = Sample1 
+BVSBWG_3 = Sample1
 
-        One mapping per line, `stub = SampleName`.
-        """
+One mapping per line, `stub = SampleName`.
+"""
     )
 
     group_map_text = st.text_area(
@@ -578,33 +617,33 @@ using built-in definitions for the Bethesda panel markers.
 
     st.header("5. Pileup Plot")
 
-    st.markdown(
-        """
-    Generate a pileup plot for *one* selected FASTQ file **and** the
-    reference for the selected marker. Upload only one FASTQ at a time
-    for pileup (multiple uploads are allowed earlier for marker analysis).
-    """
-    )
+    res = st.session_state.get("results")
+    if not res or not res.get("fastq_paths"):
+        st.info("Run the main analysis first to enable pileup plotting.")
+    else:
+        fastq_paths = res["fastq_paths"]
+        fastq_basenames = [os.path.basename(p) for p in fastq_paths]
 
-    pileup_fastq = st.selectbox(
-        "Select a FASTQ file to generate pileup",
-        options=[f.name for f in fastq_files] if fastq_files else [],
-    )
+        pileup_fastq = st.selectbox(
+            "Select a FASTQ file to generate pileup",
+            options=fastq_basenames,
+        )
 
-    if st.button("Generate pileup plot"):
-        if not pileup_fastq:
-            st.error("Please upload at least one FASTQ for pileup.")
-        else:
-            # Find the matching UploadedFile object
-            upload_obj = next((f for f in fastq_files if f.name == pileup_fastq), None)
-            if upload_obj:
-                # Run the helper
-                run_pileup_and_show(marker=marker, fastq_path=upload_obj.name)
+        if st.button("Generate pileup plot"):
+            try:
+                idx = fastq_basenames.index(pileup_fastq)
+                fq_full_path = fastq_paths[idx]
+            except (ValueError, IndexError):
+                st.error("Selected FASTQ not found. Please rerun the analysis.")
             else:
-                st.error("Selected FASTQ not found.")
+                with st.spinner("Running `msianalyzer pileup`..."):
+                    # Use the marker stored with the results (in case user changed marker in UI)
+                    marker_for_pileup = res.get("marker", marker)
+                    run_pileup_and_show(marker=marker_for_pileup, fastq_path=fq_full_path)
 
     # Always render results if present (survive download button clicks)
     render_results()
+
 
 if __name__ == "__main__":
     main()
