@@ -3,14 +3,14 @@ import os
 import json
 import tempfile
 import subprocess
+import base64
 from typing import Dict, List
 
 import streamlit as st
 
 
 # -------------------------------------------------------------------
-# 1. Marker definitions (fill out for all 5 markers as needed)
-#    For now BAT25 is filled; others are placeholders for you to edit.
+# 1. Marker definitions
 # -------------------------------------------------------------------
 MARKERS: Dict[str, Dict[str, str]] = {
     "BAT25": {
@@ -41,6 +41,9 @@ MARKERS: Dict[str, Dict[str, str]] = {
 }
 
 
+# -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
 def infer_stub_from_filename(filename: str) -> str:
     """
     Infer a 'stub' ID from a FASTQ filename, e.g.
@@ -51,7 +54,7 @@ def infer_stub_from_filename(filename: str) -> str:
     # Strip common FASTQ extensions
     for ext in (".fastq.gz", ".fq.gz", ".fastq", ".fq"):
         if base.endswith(ext):
-            base = base[:-len(ext)]
+            base = base[: -len(ext)]
             break
 
     parts = base.split("_")
@@ -62,13 +65,12 @@ def infer_stub_from_filename(filename: str) -> str:
 
 def parse_group_map_text(text: str) -> Dict[str, str]:
     """
-    Parse a simple mapping like:
+    Parse mapping like:
 
-        BVSBWG_3=Sample1
-        BVSBWG_5=Sample2
+        BVSBWG_3 = Sample1
+        BVSBWG_5 = Sample2
 
     into {"BVSBWG_3": "Sample1", "BVSBWG_5": "Sample2"}.
-    Lines starting with # or empty lines are ignored.
     """
     mapping: Dict[str, str] = {}
     for line in text.splitlines():
@@ -93,12 +95,11 @@ def build_runtime_config(
 ) -> Dict:
     """
     Build the marker JSON config in memory based on:
-    - selected marker (seq1, seq2, motif)
-    - uploaded FASTQ files (paths)
-    - numeric parameters (min_similarity, anchor_units)
+    - selected marker
+    - uploaded FASTQ files
+    - numeric parameters
     - optional user-specified group_map
     """
-
     if marker not in MARKERS:
         raise ValueError(f"Marker '{marker}' is not defined in MARKERS dict.")
 
@@ -111,7 +112,6 @@ def build_runtime_config(
     group_map: Dict[str, str] = {}
     for fq in fastq_paths:
         stub = infer_stub_from_filename(fq)
-        # If user gave an explicit mapping, use it; otherwise use stub as sample name
         sample_name = user_map.get(stub, stub)
         group_map[stub] = sample_name
 
@@ -127,14 +127,44 @@ def build_runtime_config(
         },
         "min_similarity": float(min_similarity),
         "anchor_units": int(anchor_units),
-        # Also set top-level fastq_files; MSIanalyzer uses this as global default.
         "fastq_files": fastq_paths,
     }
 
     return cfg
 
 
-def run_msianalyzer(
+def init_session_state():
+    """Initialize keys in session_state, if needed."""
+    if "results" not in st.session_state:
+        st.session_state["results"] = None  # will hold logs + file list
+    if "tmpdir" not in st.session_state:
+        st.session_state["tmpdir"] = None
+
+
+def clear_results():
+    """Clear results and (optionally) delete temp directory."""
+    tmpdir = st.session_state.get("tmpdir")
+    # We can optionally clean up tmpdir here; but OS temp dirs will be cleaned automatically.
+    st.session_state["results"] = None
+    st.session_state["tmpdir"] = None
+
+
+def embed_svg(path: str, caption: str):
+    """Display an SVG file inline using HTML."""
+    try:
+        with open(path, "rb") as f:
+            svg_bytes = f.read()
+    except OSError:
+        return
+    b64 = base64.b64encode(svg_bytes).decode("utf-8")
+    html = f'<img src="data:image/svg+xml;base64,{b64}" alt="{caption}" />'
+    st.markdown(html, unsafe_allow_html=True)
+
+
+# -------------------------------------------------------------------
+# Core runner (does the heavy work once, stores in session_state)
+# -------------------------------------------------------------------
+def run_msianalyzer_once(
     marker: str,
     fastq_files,
     min_similarity: float,
@@ -144,127 +174,172 @@ def run_msianalyzer(
     threads: int,
     group_map_text: str,
 ):
-    """Run MSIanalyzer in a temporary working directory and show results in Streamlit."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        st.write(f"Working directory: `{tmpdir}`")
+    """Run MSIanalyzer in a new temporary working directory and store results in session_state."""
 
-        # 1) Save FASTQs into a subfolder
-        fastq_dir = os.path.join(tmpdir, "fastq")
-        os.makedirs(fastq_dir, exist_ok=True)
+    # New temp dir for this run
+    tmpdir = tempfile.mkdtemp(prefix="msianalyzer_")
+    st.session_state["tmpdir"] = tmpdir
 
-        fastq_paths: List[str] = []
-        for fobj in fastq_files:
-            fq_path = os.path.join(fastq_dir, fobj.name)
-            with open(fq_path, "wb") as fh:
-                fh.write(fobj.read())
-            fastq_paths.append(fq_path)
+    st.write(f"Working directory: `{tmpdir}`")
 
-        if not fastq_paths:
-            st.error("No FASTQ files were saved. Please re-upload your FASTQ files.")
-            st.stop()
+    # 1) Save FASTQs into a subfolder
+    fastq_dir = os.path.join(tmpdir, "fastq")
+    os.makedirs(fastq_dir, exist_ok=True)
 
-        st.markdown("**FASTQ files saved:**")
-        for p in fastq_paths:
-            st.write(os.path.basename(p))
+    fastq_paths: List[str] = []
+    for fobj in fastq_files:
+        fq_path = os.path.join(fastq_dir, fobj.name)
+        with open(fq_path, "wb") as fh:
+            fh.write(fobj.read())
+        fastq_paths.append(fq_path)
 
-        # 2) Build runtime config in memory
+    if not fastq_paths:
+        st.error("No FASTQ files were saved. Please re-upload your FASTQ files.")
+        st.stop()
+
+    st.markdown("**FASTQ files saved:**")
+    for p in fastq_paths:
+        st.write(os.path.basename(p))
+
+    # 2) Build runtime config in memory
+    try:
+        cfg = build_runtime_config(
+            marker=marker,
+            fastq_paths=fastq_paths,
+            min_similarity=min_similarity,
+            anchor_units=anchor_units,
+            user_group_map_text=group_map_text,
+        )
+    except Exception as e:
+        st.error("Failed to build marker configuration.")
+        st.exception(e)
+        st.stop()
+
+    # 3) Write config to JSON in temp dir
+    manifest_path = os.path.join(tmpdir, "manifest_runtime.json")
+    with open(manifest_path, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+    st.markdown("**Runtime manifest written to:**")
+    st.code(manifest_path)
+
+    # 4) Build command
+    st.subheader("Command to be executed")
+    cmd = ["msianalyzer", "run-marker", marker, manifest_path]
+    if run_tests:
+        cmd.append("--run-tests")
+    if skip_variant_summary:
+        cmd.append("--skip-variant-summary")
+    if threads and threads > 1:
+        cmd.extend(["--threads", str(threads)])
+
+    st.code(" ".join(cmd), language="bash")
+
+    # 5) Run MSIanalyzer
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=tmpdir,
+            capture_output=True,
+            text=True,
+            timeout=3600,  # 1 hour; adjust if needed
+        )
+    except FileNotFoundError as e:
+        st.error(
+            "Failed to run `msianalyzer`. Make sure it is installed and in PATH "
+            "(via `requirements.txt`)."
+        )
+        st.exception(e)
+        st.stop()
+    except subprocess.TimeoutExpired as e:
+        st.error("MSIanalyzer run timed out.")
+        st.exception(e)
+        st.stop()
+
+    # 6) Collect logs and files into session_state
+    files_info = []
+    for root, dirs, files in os.walk(tmpdir):
+        rel_root = os.path.relpath(root, tmpdir)
+        for name in files:
+            path = os.path.join(root, name)
+            relpath = os.path.join(rel_root, name) if rel_root != "." else name
+            files_info.append(
+                {
+                    "path": path,
+                    "relpath": relpath,
+                    "name": name,
+                }
+            )
+
+    st.session_state["results"] = {
+        "stdout": result.stdout or "",
+        "stderr": result.stderr or "",
+        "returncode": result.returncode,
+        "files": files_info,
+    }
+
+
+# -------------------------------------------------------------------
+# UI rendering of stored results (no heavy work)
+# -------------------------------------------------------------------
+def render_results():
+    """Render logs and generated files from st.session_state['results']."""
+    res = st.session_state.get("results")
+    if not res:
+        return
+
+    st.subheader("MSIanalyzer output")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("**stdout**")
+        st.text_area("stdout", res["stdout"] or "(no stdout)", height=200)
+    with col2:
+        st.markdown("**stderr**")
+        st.text_area("stderr", res["stderr"] or "(no stderr)", height=200)
+
+    if res["returncode"] != 0:
+        st.error(f"MSIanalyzer exited with non-zero code: {res['returncode']}")
+    else:
+        st.success("MSIanalyzer finished successfully.")
+
+    st.subheader("Generated files")
+
+    for finfo in res["files"]:
+        path = finfo["path"]
+        relpath = finfo["relpath"]
+        name = finfo["name"]
+
+        # Preview images: PNG/JPG
+        if name.lower().endswith((".png", ".jpg", ".jpeg")):
+            st.image(path, caption=f"Preview: {relpath}")
+
+        # Preview SVG
+        if name.lower().endswith(".svg"):
+            st.markdown(f"**SVG preview: {relpath}**")
+            embed_svg(path, caption=relpath)
+
+        # Download button for every file
         try:
-            cfg = build_runtime_config(
-                marker=marker,
-                fastq_paths=fastq_paths,
-                min_similarity=min_similarity,
-                anchor_units=anchor_units,
-                user_group_map_text=group_map_text,
-            )
-        except Exception as e:
-            st.error("Failed to build marker configuration.")
-            st.exception(e)
-            st.stop()
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            continue
 
-        # 3) Write config to JSON in temp dir
-        manifest_path = os.path.join(tmpdir, "manifest_runtime.json")
-        with open(manifest_path, "w") as f:
-            json.dump(cfg, f, indent=2)
-
-        st.markdown("**Runtime manifest written to:**")
-        st.code(manifest_path)
-
-        # 4) Build command
-        st.subheader("Command to be executed")
-        cmd = ["msianalyzer", "run-marker", marker, manifest_path]
-        if run_tests:
-            cmd.append("--run-tests")
-        if skip_variant_summary:
-            cmd.append("--skip-variant-summary")
-        if threads and threads > 1:
-            cmd.extend(["--threads", str(threads)])
-
-        st.code(" ".join(cmd), language="bash")
-
-        # 5) Run MSIanalyzer
-        try:
-            result = subprocess.run(
-                cmd,
-                cwd=tmpdir,
-                capture_output=True,
-                text=True,
-                timeout=3600,  # 1 hour; adjust if needed
-            )
-        except FileNotFoundError as e:
-            st.error(
-                "Failed to run `msianalyzer`. Make sure it is installed and in PATH "
-                "(via `requirements.txt`)."
-            )
-            st.exception(e)
-            st.stop()
-        except subprocess.TimeoutExpired as e:
-            st.error("MSIanalyzer run timed out.")
-            st.exception(e)
-            st.stop()
-
-        # 6) Show logs
-        st.subheader("MSIanalyzer output")
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("**stdout**")
-            st.text_area("stdout", result.stdout or "(no stdout)", height=200)
-        with col2:
-            st.markdown("**stderr**")
-            st.text_area("stderr", result.stderr or "(no stderr)", height=200)
-
-        if result.returncode != 0:
-            st.error(f"MSIanalyzer exited with non-zero code: {result.returncode}")
-            # Still show any files that were produced.
-        else:
-            st.success("MSIanalyzer finished successfully.")
-
-        # 7) Expose all output files for download, preview images
-        st.subheader("Generated files")
-
-        for root, dirs, files in os.walk(tmpdir):
-            rel_root = os.path.relpath(root, tmpdir)
-            for name in files:
-                path = os.path.join(root, name)
-                relpath = os.path.join(rel_root, name) if rel_root != "." else name
-
-                # Show image preview for PNG/JPEG
-                if name.lower().endswith((".png", ".jpg", ".jpeg")):
-                    st.image(path, caption=f"Preview: {relpath}")
-
-                # Download button for every file
-                with open(path, "rb") as fh:
-                    data = fh.read()
-                st.download_button(
-                    label=f"Download {relpath}",
-                    data=data,
-                    file_name=relpath,
-                    key=path,  # unique key per file
-                )
+        st.download_button(
+            label=f"Download {relpath}",
+            data=data,
+            file_name=relpath,
+            key=path,  # must be unique per file
+        )
 
 
+# -------------------------------------------------------------------
+# Main UI
+# -------------------------------------------------------------------
 def main():
     st.set_page_config(page_title="MSIanalyzer Web App", layout="wide")
+    init_session_state()
 
     st.title("MSIanalyzer Web Interface")
 
@@ -276,17 +351,16 @@ using built-in definitions for the Bethesda panel markers.
 **Workflow:**
 
 1. Select the marker (BAT25, BAT26, D2S123, D5S346, D17S250).
-2. Optionally adjust `min_similarity` and `anchor_units` (defaults match the paper/example).
+2. Optionally adjust `min_similarity` and `anchor_units`.
 3. Upload one or more FASTQ files (Nanopore reads for that marker).
 4. Optionally provide a mapping from FASTQ-derived IDs to sample/group names.
-5. The app will:
-   - Save FASTQs to a temporary working directory,
-   - Build an internal JSON manifest (primers, motif, group_map, fastq_files, parameters),
-   - Run `msianalyzer run-marker`,
-   - Show logs and make output files available for download.
+5. Click **Run analysis**.
+6. You can download any output files without losing the others.
+7. Click **Clear results** if you want to reset and start again.
 """
     )
 
+    # Top-level controls
     st.header("1. Marker and parameters")
 
     marker = st.selectbox(
@@ -352,9 +426,10 @@ using built-in definitions for the Bethesda panel markers.
         and dropping the last underscore-delimited token (e.g., `BVSBWG_3_500x.fastq` → stub `BVSBWG_3`),
         and the stub itself is used as the sample name.
 
-        You can override this by providing mappings like:
-        BVSBWG_3 = Sample1
-        BVSBWG_5 = Sample2
+        You can override this by providing mappings like: 
+
+        BVSBWG_3 = Sample1 
+
         One mapping per line, `stub = SampleName`.
         """
     )
@@ -365,16 +440,27 @@ using built-in definitions for the Bethesda panel markers.
         height=120,
     )
 
-    st.header("4. Run MSIanalyzer")
+    st.header("4. Run / Clear")
 
-    if st.button("Run analysis"):
+    cols = st.columns(2)
+    with cols[0]:
+        run_clicked = st.button("Run analysis")
+    with cols[1]:
+        clear_clicked = st.button("Clear results")
+
+    if clear_clicked:
+        clear_results()
+        st.info("Results cleared. You can upload new files and run again.")
+
+    if run_clicked:
         if not fastq_files:
             st.error("Please upload at least one FASTQ file.")
         else:
             with st.spinner(
                 "Running MSIanalyzer... this may take a few minutes depending on input size."
             ):
-                run_msianalyzer(
+                # Running will overwrite any previous results and tmpdir
+                run_msianalyzer_once(
                     marker=marker,
                     fastq_files=fastq_files,
                     min_similarity=float(min_similarity),
@@ -384,6 +470,9 @@ using built-in definitions for the Bethesda panel markers.
                     threads=int(threads),
                     group_map_text=group_map_text,
                 )
+
+    # Always render results if present (survive download button clicks)
+    render_results()
 
 
 if __name__ == "__main__":
