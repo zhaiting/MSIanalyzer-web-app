@@ -1,0 +1,4 @@
+streamlit>=1.38
+
+# Install MSIanalyzer directly from GitHub
+msianalyzer @ git+https://github.com/NagelLabHub/MSIanalyzer.git
