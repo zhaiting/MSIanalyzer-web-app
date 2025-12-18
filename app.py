@@ -161,32 +161,30 @@ def embed_svg(path: str, caption: str):
     html = f'<img src="data:image/svg+xml;base64,{b64}" alt="{caption}" />'
     st.markdown(html, unsafe_allow_html=True)
 
+from pathlib import Path
+EXAMPLES_HG38_DIR = Path(__file__).resolve().parent / "hg38"
+
 def get_reference_for_marker(marker: str) -> str:
     """
-    Return the path to the reference FASTA for the given marker.
-
-    Assumes MSIanalyzer examples contain hg38 references under:
-        examples/hg38/<chr>_<marker>.fa
-
-    Adjust this base path if your deployed app vendors the reference elsewhere.
+    Return the path to the reference FASTA for the given marker,
+    by searching in the local hg38/ directory.
     """
-    # Base path inside the installed MSIanalyzer package
-    try:
-        import pkg_resources
-        examples_root = pkg_resources.resource_filename("motif_pipeline", "examples")
-    except Exception:
-        # Fallback: assume local "examples" folder next to app.py
-        examples_root = os.path.join(os.getcwd(), "examples")
+    if not EXAMPLES_HG38_DIR.is_dir():
+        raise FileNotFoundError(
+            f"Reference directory not found: {EXAMPLES_HG38_DIR}. "
+            "Make sure the hg38 folder is included in your repo."
+        )
 
-    hg38_dir = os.path.join(examples_root, "hg38")
+    marker_lower = marker.lower()
 
-    # Construct a candidate filename based on marker
-    # (E.g., "BAT25" → "chr4_BAT25.fa")
-    for filename in os.listdir(hg38_dir):
-        if filename.lower().endswith(".fa") and marker.lower() in filename.lower():
-            return os.path.join(hg38_dir, filename)
+    for filename in os.listdir(EXAMPLES_HG38_DIR):
+        if filename.lower().endswith((".fa", ".fasta")):
+            if marker_lower in filename.lower():
+                return str(EXAMPLES_HG38_DIR / filename)
 
-    raise FileNotFoundError(f"No reference FASTA found in {hg38_dir} for marker {marker}")
+    raise FileNotFoundError(
+        f"No reference FASTA found in {EXAMPLES_HG38_DIR} for marker '{marker}'."
+    )
 
 # -------------------------------------------------------------------
 # Core runner (does the heavy work once, stores in session_state)
