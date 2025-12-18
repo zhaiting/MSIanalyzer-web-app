@@ -2,6 +2,7 @@
 import os
 import json
 import tempfile
+import shutil
 import subprocess
 import base64
 from typing import Dict, List
@@ -160,6 +161,32 @@ def embed_svg(path: str, caption: str):
     html = f'<img src="data:image/svg+xml;base64,{b64}" alt="{caption}" />'
     st.markdown(html, unsafe_allow_html=True)
 
+def get_reference_for_marker(marker: str) -> str:
+    """
+    Return the path to the reference FASTA for the given marker.
+
+    Assumes MSIanalyzer examples contain hg38 references under:
+        examples/hg38/<chr>_<marker>.fa
+
+    Adjust this base path if your deployed app vendors the reference elsewhere.
+    """
+    # Base path inside the installed MSIanalyzer package
+    try:
+        import pkg_resources
+        examples_root = pkg_resources.resource_filename("motif_pipeline", "examples")
+    except Exception:
+        # Fallback: assume local "examples" folder next to app.py
+        examples_root = os.path.join(os.getcwd(), "examples")
+
+    hg38_dir = os.path.join(examples_root, "hg38")
+
+    # Construct a candidate filename based on marker
+    # (E.g., "BAT25" → "chr4_BAT25.fa")
+    for filename in os.listdir(hg38_dir):
+        if filename.lower().endswith(".fa") and marker.lower() in filename.lower():
+            return os.path.join(hg38_dir, filename)
+
+    raise FileNotFoundError(f"No reference FASTA found in {hg38_dir} for marker {marker}")
 
 # -------------------------------------------------------------------
 # Core runner (does the heavy work once, stores in session_state)
@@ -278,6 +305,86 @@ def run_msianalyzer_once(
         "files": files_info,
     }
 
+def run_pileup_and_show(marker: str, fastq_path: str):
+    """
+    Run the `msianalyzer pileup` command for the given FASTQ and reference.
+    Displays the resulting plot in Streamlit.
+    """
+
+    try:
+        ref_path = get_reference_for_marker(marker)
+    except FileNotFoundError as e:
+        st.error(str(e))
+        return
+
+    # Create a temp working directory for this run
+    tmpdir = tempfile.mkdtemp(prefix="msianalyzer_pileup_")
+    st.write(f"Pileup working directory: `{tmpdir}`")
+
+    # Copy or link the input FASTQ into tmpdir
+    local_fastq = os.path.join(tmpdir, os.path.basename(fastq_path))
+    try:
+        # If we already have a local path (e.g., from upload), just copy
+        shutil.copy(fastq_path, local_fastq)
+    except Exception:
+        st.error(f"Failed to stage FASTQ for pileup: {fastq_path}")
+        return
+
+    # Build the pileup command
+    cmd = ["msianalyzer", "pileup", local_fastq, ref_path]
+
+    st.code(" ".join(cmd), language="bash")
+
+    # Execute the pileup
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=tmpdir,
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
+    except FileNotFoundError:
+        st.error("Failed to run `msianalyzer pileup`. Make sure it’s installed in PATH.")
+        return
+    except subprocess.TimeoutExpired:
+        st.error("Pileup command timed out.")
+        return
+
+    if result.returncode != 0:
+        st.error(f"`msianalyzer pileup` exited with code {result.returncode}")
+        st.text_area("stderr", result.stderr or "(no stderr)")
+        return
+
+    # Locate any image files created by the pileup command in tmpdir
+    plot_files = [
+        os.path.join(tmpdir, f)
+        for f in os.listdir(tmpdir)
+        if f.lower().endswith((".png", ".svg", ".jpg", ".jpeg"))
+    ]
+
+    if not plot_files:
+        st.warning("No plot files were produced by the pileup command.")
+        return
+
+    st.subheader("Pileup Plot Results")
+    for filepath in plot_files:
+        name = os.path.basename(filepath)
+        if name.lower().endswith(".svg"):
+            st.markdown(f"**SVG: {name}**")
+            embed_svg(filepath, caption=name)
+        else:
+            st.image(filepath, caption=name)
+
+        # Add download button
+        with open(filepath, "rb") as fh:
+            data = fh.read()
+            st.download_button(
+                label=f"Download {name}",
+                data=data,
+                file_name=name,
+                key=f"pileup_{name}",
+            )
 
 # -------------------------------------------------------------------
 # UI rendering of stored results (no heavy work)
@@ -471,9 +578,35 @@ using built-in definitions for the Bethesda panel markers.
                     group_map_text=group_map_text,
                 )
 
+    st.header("5. Pileup Plot")
+
+    st.markdown(
+        """
+    Generate a pileup plot for *one* selected FASTQ file **and** the
+    reference for the selected marker. Upload only one FASTQ at a time
+    for pileup (multiple uploads are allowed earlier for marker analysis).
+    """
+    )
+
+    pileup_fastq = st.selectbox(
+        "Select a FASTQ file to generate pileup",
+        options=[f.name for f in fastq_files] if fastq_files else [],
+    )
+
+    if st.button("Generate pileup plot"):
+        if not pileup_fastq:
+            st.error("Please upload at least one FASTQ for pileup.")
+        else:
+            # Find the matching UploadedFile object
+            upload_obj = next((f for f in fastq_files if f.name == pileup_fastq), None)
+            if upload_obj:
+                # Run the helper
+                run_pileup_and_show(marker=marker, fastq_path=upload_obj.name)
+            else:
+                st.error("Selected FASTQ not found.")
+
     # Always render results if present (survive download button clicks)
     render_results()
-
 
 if __name__ == "__main__":
     main()
